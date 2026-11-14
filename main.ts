@@ -24,6 +24,11 @@ import {
   openAIError,
   openAIModelList,
   openAIToAnthropic,
+  openAIToGemini,
+  geminiToOpenAI,
+  geminiStreamToOpenAI,
+  anthropicToGemini,
+  geminiToAnthropic,
   type ServedModel,
 } from './lib/wire.ts';
 
@@ -74,6 +79,7 @@ interface Candidate {
   model: ProbedModel;
   rating: number;
 }
+
 /**
  * Return a RANKED LIST of candidates (probe+model) that are free and meet the requirements,
  * sorted by rating_milli descending (missing row counts as 0). Skip paid models.
@@ -126,6 +132,7 @@ function requirementsFromBody(body: Json): Requirement {
   const format = isRecord(body.response_format) ? body.response_format.type : undefined;
   return { tools: Array.isArray(body.tools) && body.tools.length > 0, vision, json: format === 'json_object' || format === 'json_schema' };
 }
+
 async function readJson(req: IncomingMessage): Promise<Json | null> {
   const chunks: Buffer[] = [];
   let size = 0;
@@ -171,8 +178,28 @@ async function callProvider(probe: Probe, modelId: string, body: Json): Promise<
     'content-type': 'application/json',
     ...authHeaders(probe.provider.auth, probe.provider.key),
   };
+
+  if (probe.provider.wire === 'gemini') {
+    const geminiBody = openAIToGemini({ ...body, model: modelId }, modelId);
+    const action = body.stream === true ? 'streamGenerateContent?alt=sse' : 'generateContent';
+    if (body.stream === true) headers.accept = 'text/event-stream';
+    return fetch(`${base}/v1beta/models/${modelId}:${action}`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(geminiBody),
+    });
+  }
+
+  // OpenAI wire
   if (body.stream === true) headers.accept = 'text/event-stream';
-  return fetch(`${base}/v1/chat/completions`, { method: 'POST', headers, body: JSON.stringify({ ...body, model: modelId }) });
+  const payload: Json = { ...body, model: modelId };
+  if (payload.stream === true) {
+    payload.stream_options = {
+      include_usage: true,
+      ...(isRecord(payload.stream_options) ? payload.stream_options : {}),
+    };
+  }
+  return fetch(`${base}/v1/chat/completions`, { method: 'POST', headers, body: JSON.stringify(payload) });
 }
 
 async function pipeStream(stream: ReadableStream<Uint8Array>, res: ServerResponse): Promise<void> {
@@ -188,6 +215,19 @@ async function pipeStream(stream: ReadableStream<Uint8Array>, res: ServerRespons
     res.end();
   }
 }
+
+function sseStringStreamToReadable(generator: AsyncGenerator<string>): ReadableStream<Uint8Array> {
+  const encoder = new TextEncoder();
+  return new ReadableStream({
+    async start(controller) {
+      for await (const chunk of generator) {
+        controller.enqueue(encoder.encode(chunk));
+      }
+      controller.close();
+    },
+  });
+}
+
 /**
  * Try candidates with rating routing, per-provider soft budget (<4 calls preferred),
  * and failover (HTTP 402/429/5xx or fetch throw marks provider suspect for this request and tries next).
@@ -195,7 +235,7 @@ async function pipeStream(stream: ReadableStream<Uint8Array>, res: ServerRespons
 async function executeWithFailover(
   requires: Requirement,
   body: Json,
-  isAnthropicWireClient: boolean
+  _isAnthropicWireClient: boolean
 ): Promise<{ upstream: Response; candidate: Candidate } | null> {
   const candidates = rankedCandidatesFor(requires);
   if (candidates.length === 0) return null;
@@ -216,8 +256,8 @@ async function executeWithFailover(
     const pId = candidate.probe.provider.id;
     if (suspectProviders.has(pId)) continue;
 
-    // Skip non-openai-wire providers for now (Step 3: leave TODO comment, gemini/anthropic upstream comes in Step 5/6)
-    if (candidate.probe.provider.wire !== 'openai') {
+    // Support openai and gemini wires
+    if (candidate.probe.provider.wire !== 'openai' && candidate.probe.provider.wire !== 'gemini') {
       continue;
     }
 
@@ -235,7 +275,6 @@ async function executeWithFailover(
     }
   }
 
-  // If all openai-wire candidates failed or were skipped, check if any non-openai candidates exist (for step 3, we return null)
   return null;
 }
 
@@ -245,20 +284,31 @@ async function chat(req: IncomingMessage, res: ServerResponse): Promise<void> {
   const requires = requirementsFor(body);
   const result = await executeWithFailover(requires, body, false);
   if (result === null) {
-    // Check if there are any candidates at all vs no free model
     const candidates = rankedCandidatesFor(requires);
     if (candidates.length === 0) {
       return sendError(res, 'openai', 503, 'no_free_model', 'no free model on the directory meets this request');
     }
-    // Found candidates, but none could be successfully called (e.g. non-openai wire or all failed)
-    const firstNonOpenai = candidates.find(c => c.probe.provider.wire !== 'openai');
-    if (firstNonOpenai) {
-      return sendError(res, 'openai', 501, 'not_implemented', `the ${firstNonOpenai.probe.provider.wire} upstream wire is not implemented in this baseline`);
+    const firstUnsupported = candidates.find(c => c.probe.provider.wire !== 'openai' && c.probe.provider.wire !== 'gemini');
+    if (firstUnsupported) {
+      return sendError(res, 'openai', 501, 'not_implemented', `the ${firstUnsupported.probe.provider.wire} upstream wire is not implemented in this baseline`);
     }
     return sendError(res, 'openai', 503, 'service_unavailable', 'all candidate providers failed or exhausted failover');
   }
 
   const { upstream, candidate } = result;
+  if (candidate.probe.provider.wire === 'gemini') {
+    if (body.stream === true && upstream.ok && upstream.body !== null) {
+      res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive' });
+      await pipeStream(sseStringStreamToReadable(geminiStreamToOpenAI(upstream.body)), res);
+      return;
+    }
+    const answer: unknown = await upstream.json();
+    const openaiAnswer = geminiToOpenAI(isRecord(answer) ? answer : {}, candidate.model.id);
+    sendJson(res, upstream.status, openaiAnswer);
+    return;
+  }
+
+  // OpenAI wire
   if (body.stream === true && upstream.ok && upstream.body !== null) {
     res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive' });
     await pipeStream(upstream.body, res);
@@ -268,6 +318,7 @@ async function chat(req: IncomingMessage, res: ServerResponse): Promise<void> {
   res.writeHead(upstream.status, { 'content-type': upstream.headers.get('content-type') ?? 'application/json' });
   res.end(text);
 }
+
 async function messages(req: IncomingMessage, res: ServerResponse): Promise<void> {
   const body = await readJson(req);
   if (body === null) return sendError(res, 'anthropic', 400, 'invalid_request_error', 'the request body is not one JSON object');
@@ -277,9 +328,8 @@ async function messages(req: IncomingMessage, res: ServerResponse): Promise<void
     return sendError(res, 'anthropic', 503, 'overloaded_error', 'no free model on the directory meets this request');
   }
 
-  // Translate Anthropic body to OpenAI body for calling OpenAI-wire providers
-  const firstOpenaiCandidate = candidates.find(c => c.probe.provider.wire === 'openai');
-  if (!firstOpenaiCandidate) {
+  const firstCandidate = candidates.find(c => c.probe.provider.wire === 'openai' || c.probe.provider.wire === 'gemini');
+  if (!firstCandidate) {
     const firstAny = candidates[0];
     if (firstAny) {
       return sendError(res, 'anthropic', 501, 'api_error', `the ${firstAny.probe.provider.wire} upstream wire is not implemented in this baseline`);
@@ -287,26 +337,38 @@ async function messages(req: IncomingMessage, res: ServerResponse): Promise<void
     return sendError(res, 'anthropic', 503, 'overloaded_error', 'no free model meets requirements');
   }
 
-  const requested = typeof body.model === 'string' && body.model !== '' ? body.model : firstOpenaiCandidate.model.id;
-  const translatedBody = anthropicToOpenAI(body, firstOpenaiCandidate.model.id);
+  const requested = typeof body.model === 'string' && body.model !== '' ? body.model : firstCandidate.model.id;
+  const translatedBody = anthropicToOpenAI(body, firstCandidate.model.id);
 
   const result = await executeWithFailover(requires, translatedBody, true);
   if (result === null) {
     return sendError(res, 'anthropic', 503, 'overloaded_error', 'all free model providers failed');
   }
 
-  const { upstream } = result;
+  const { upstream, candidate } = result;
   if (!upstream.ok) {
     const text = await upstream.text();
     return sendJson(res, upstream.status, anthropicError('api_error', `the provider answered HTTP ${upstream.status}: ${text.slice(0, 500)}`));
   }
+
   if (body.stream === true && upstream.body !== null) {
     res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive' });
-    for await (const event of anthropicEventsFromOpenAI(upstream.body, requested)) res.write(event);
+    if (candidate.probe.provider.wire === 'gemini') {
+      const openAiStream = sseStringStreamToReadable(geminiStreamToOpenAI(upstream.body));
+      for await (const event of anthropicEventsFromOpenAI(openAiStream, requested)) res.write(event);
+    } else {
+      for await (const event of anthropicEventsFromOpenAI(upstream.body, requested)) res.write(event);
+    }
     res.end();
     return;
   }
+
   const answer: unknown = await upstream.json();
+  if (candidate.probe.provider.wire === 'gemini') {
+    const openaiAnswer = geminiToOpenAI(isRecord(answer) ? answer : {}, requested);
+    sendJson(res, 200, openAIToAnthropic(openaiAnswer, requested));
+    return;
+  }
   sendJson(res, 200, openAIToAnthropic(isRecord(answer) ? answer : {}, requested));
 }
 

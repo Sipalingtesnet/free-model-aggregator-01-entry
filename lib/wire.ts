@@ -401,3 +401,344 @@ export async function* anthropicEventsFromOpenAI(upstream: ReadableStream<Uint8A
     for (const event of finishEvents(pendingStop ?? 'end_turn')) yield event;
   }
 }
+
+/** OpenAI chat body -> Gemini generateContent body. */
+export function openAIToGemini(body: Json, _model: string): Json {
+  const contents: Json[] = [];
+  let systemInstruction: Json | undefined = undefined;
+
+  const messages = Array.isArray(body.messages) ? body.messages : [];
+  for (const msg of messages) {
+    if (!isRecord(msg)) continue;
+    const role = msg.role;
+    const content = msg.content;
+
+    if (role === 'system') {
+      const text = textOf(content);
+      if (text !== '') {
+        systemInstruction = { parts: [{ text }] };
+      }
+      continue;
+    }
+
+    const geminiRole = role === 'assistant' ? 'model' : 'user';
+    const parts: Json[] = [];
+
+    if (typeof content === 'string' && content !== '') {
+      parts.push({ text: content });
+    } else if (Array.isArray(content)) {
+      for (const block of content) {
+        if (!isRecord(block)) continue;
+        if (block.type === 'text' && typeof block.text === 'string') {
+          parts.push({ text: block.text });
+        } else if (block.type === 'image_url' && isRecord(block.image_url) && typeof block.image_url.url === 'string') {
+          const url = block.image_url.url;
+          if (url.startsWith('data:')) {
+            const match = url.match(/^data:([^;]+);base64,(.+)$/);
+            if (match) {
+              parts.push({ inlineData: { mimeType: match[1], data: match[2] } });
+            } else {
+              parts.push({ text: url });
+            }
+          } else {
+            parts.push({ text: url });
+          }
+        }
+      }
+    }
+
+    // Handle tool calls in assistant messages
+    if (role === 'assistant' && Array.isArray(msg.tool_calls)) {
+      for (const call of msg.tool_calls) {
+        if (!isRecord(call) || !isRecord(call.function)) continue;
+        const name = typeof call.function.name === 'string' ? call.function.name : '';
+        let args: Json = {};
+        try {
+          if (typeof call.function.arguments === 'string') {
+            args = JSON.parse(call.function.arguments);
+          } else if (isRecord(call.function.arguments)) {
+            args = call.function.arguments;
+          }
+        } catch {
+          args = {};
+        }
+        parts.push({ functionCall: { name, args } });
+      }
+    }
+
+    // Handle tool response messages
+    if (role === 'tool') {
+      const name = typeof msg.name === 'string' ? msg.name : (typeof msg.tool_call_id === 'string' ? msg.tool_call_id : 'tool');
+      const responseText = typeof content === 'string' ? content : JSON.stringify(content ?? '');
+      let responseObj: Json;
+      try {
+        responseObj = JSON.parse(responseText);
+        if (!isRecord(responseObj)) responseObj = { output: responseText };
+      } catch {
+        responseObj = { output: responseText };
+      }
+      contents.push({
+        role: 'user',
+        parts: [{ functionResponse: { name, response: responseObj } }],
+      });
+      continue;
+    }
+
+    if (parts.length > 0) {
+      contents.push({ role: geminiRole, parts });
+    }
+  }
+
+  const geminiBody: Json = { contents };
+  if (systemInstruction) {
+    geminiBody.systemInstruction = systemInstruction;
+  }
+
+  const generationConfig: Json = {};
+  if (typeof body.temperature === 'number') generationConfig.temperature = body.temperature;
+  if (typeof body.top_p === 'number') generationConfig.top_p = body.top_p;
+  if (typeof body.max_tokens === 'number') generationConfig.maxOutputTokens = body.max_tokens;
+  if (Array.isArray(body.stop)) {
+    generationConfig.stopSequences = body.stop;
+  } else if (typeof body.stop === 'string') {
+    generationConfig.stopSequences = [body.stop];
+  }
+  const format = isRecord(body.response_format) ? body.response_format.type : undefined;
+  if (format === 'json_object' || format === 'json_schema') {
+    generationConfig.responseMimeType = 'application/json';
+  }
+  if (Object.keys(generationConfig).length > 0) {
+    geminiBody.generationConfig = generationConfig;
+  }
+
+  if (Array.isArray(body.tools) && body.tools.length > 0) {
+    const functionDeclarations: Json[] = [];
+    for (const tool of body.tools) {
+      if (!isRecord(tool) || !isRecord(tool.function)) continue;
+      const fn = tool.function;
+      const name = typeof fn.name === 'string' ? fn.name : '';
+      const description = typeof fn.description === 'string' ? fn.description : '';
+      const parameters = isRecord(fn.parameters) ? fn.parameters : { type: 'object', properties: {} };
+      functionDeclarations.push({ name, description, parameters });
+    }
+    if (functionDeclarations.length > 0) {
+      geminiBody.tools = [{ functionDeclarations }];
+    }
+  }
+
+  return geminiBody;
+}
+
+/** Gemini JSON -> OpenAI chat completion JSON. */
+export function geminiToOpenAI(answer: Json, model: string): Json {
+  const candidates = Array.isArray(answer.candidates) ? answer.candidates : [];
+  const candidate = isRecord(candidates[0]) ? candidates[0] : {};
+  const contentObj = isRecord(candidate.content) ? candidate.content : {};
+  const parts = Array.isArray(contentObj.parts) ? contentObj.parts : [];
+
+  let textContent = '';
+  const toolCalls: Json[] = [];
+
+  for (const part of parts) {
+    if (!isRecord(part)) continue;
+    if (typeof part.text === 'string') {
+      textContent += part.text;
+    }
+    if (isRecord(part.functionCall)) {
+      const fc = part.functionCall;
+      const name = typeof fc.name === 'string' ? fc.name : '';
+      const args = isRecord(fc.args) ? fc.args : {};
+      const callId = `call_${toolCalls.length}`;
+      toolCalls.push({
+        id: callId,
+        type: 'function',
+        function: {
+          name,
+          arguments: JSON.stringify(args),
+        },
+      });
+    }
+  }
+
+  let finishReason = 'stop';
+  const fr = candidate.finishReason;
+  if (fr === 'MAX_TOKENS') finishReason = 'length';
+  else if (fr === 'SAFETY') finishReason = 'content_filter';
+  else if (toolCalls.length > 0) finishReason = 'tool_calls';
+
+  const usageMeta = isRecord(answer.usageMetadata) ? answer.usageMetadata : {};
+  const promptTokens = numberOrZero(usageMeta.promptTokenCount);
+  const completionTokens = numberOrZero(usageMeta.candidatesTokenCount);
+  const totalTokens = numberOrZero(usageMeta.totalTokenCount) || (promptTokens + completionTokens);
+
+  return {
+    id: 'chatcmpl-gemini',
+    object: 'chat.completion',
+    created: FIXED_OPENAI_CREATED,
+    model,
+    choices: [
+      {
+        index: 0,
+        message: {
+          role: 'assistant',
+          content: textContent !== '' ? textContent : (toolCalls.length > 0 ? null : ''),
+          ...(toolCalls.length > 0 ? { tool_calls: toolCalls } : {}),
+        },
+        finish_reason: finishReason,
+      },
+    ],
+    usage: {
+      prompt_tokens: promptTokens,
+      completion_tokens: completionTokens,
+      total_tokens: totalTokens,
+    },
+  };
+}
+
+/** Async generator yielding OpenAI SSE strings from a Gemini :streamGenerateContent SSE stream. */
+export async function* geminiStreamToOpenAI(stream: ReadableStream<Uint8Array>): AsyncGenerator<string> {
+  const reader = stream.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  let promptTokens = 0;
+  let completionTokens = 0;
+  let totalTokens = 0;
+  let lastFinishReason = 'stop';
+  let hasSentContent = false;
+  let toolCallIndex = 0;
+
+  const emitChunk = (delta: Json, finishReason: string | null = null, usage: Json | null = null): string => {
+    const chunk: Json = {
+      id: 'chatcmpl-gemini',
+      object: 'chat.completion.chunk',
+      created: FIXED_OPENAI_CREATED,
+      model: 'gemini',
+      choices: [
+        {
+          index: 0,
+          delta,
+          finish_reason: finishReason,
+        },
+      ],
+    };
+    if (usage) {
+      chunk.usage = usage;
+    }
+    return `data: ${JSON.stringify(chunk)}\n\n`;
+  };
+
+  const processFrame = (frame: string): string[] => {
+    const out: string[] = [];
+    for (const line of frame.split('\n')) {
+      const trimmed = line.trim();
+      if (!trimmed.startsWith('data:')) continue;
+      const payload = trimmed.slice(5).trim();
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(payload);
+      } catch {
+        continue;
+      }
+      if (!isRecord(parsed)) continue;
+
+      if (isRecord(parsed.usageMetadata)) {
+        promptTokens = numberOrZero(parsed.usageMetadata.promptTokenCount);
+        completionTokens = numberOrZero(parsed.usageMetadata.candidatesTokenCount);
+        totalTokens = numberOrZero(parsed.usageMetadata.totalTokenCount) || (promptTokens + completionTokens);
+      }
+
+      const candidates = Array.isArray(parsed.candidates) ? parsed.candidates : [];
+      const candidate = isRecord(candidates[0]) ? candidates[0] : null;
+      if (!candidate) continue;
+
+      if (typeof candidate.finishReason === 'string') {
+        if (candidate.finishReason === 'MAX_TOKENS') lastFinishReason = 'length';
+        else if (candidate.finishReason === 'SAFETY') lastFinishReason = 'content_filter';
+        else if (candidate.finishReason === 'STOP') lastFinishReason = 'stop';
+      }
+
+      const contentObj = isRecord(candidate.content) ? candidate.content : {};
+      const parts = Array.isArray(contentObj.parts) ? contentObj.parts : [];
+
+      for (const part of parts) {
+        if (!isRecord(part)) continue;
+        if (typeof part.text === 'string' && part.text !== '') {
+          if (!hasSentContent) {
+            hasSentContent = true;
+            out.push(emitChunk({ role: 'assistant', content: '' }));
+          }
+          out.push(emitChunk({ content: part.text }));
+        }
+        if (isRecord(part.functionCall)) {
+          const fc = part.functionCall;
+          const name = typeof fc.name === 'string' ? fc.name : '';
+          const args = isRecord(fc.args) ? fc.args : {};
+          const callId = `call_${toolCallIndex}`;
+          toolCallIndex += 1;
+          lastFinishReason = 'tool_calls';
+          if (!hasSentContent) {
+            hasSentContent = true;
+            out.push(emitChunk({ role: 'assistant', content: null }));
+          }
+          out.push(emitChunk({
+            tool_calls: [
+              {
+                index: 0,
+                id: callId,
+                type: 'function',
+                function: { name, arguments: JSON.stringify(args) },
+              },
+            ],
+          }));
+        }
+      }
+    }
+    return out;
+  };
+
+  try {
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true }).replace(/\r\n/g, '\n');
+      let at = buffer.indexOf('\n\n');
+      while (at !== -1) {
+        const frame = buffer.slice(0, at);
+        buffer = buffer.slice(at + 2);
+        for (const lineEv of processFrame(frame)) yield lineEv;
+        at = buffer.indexOf('\n\n');
+      }
+    }
+    buffer += decoder.decode();
+    if (buffer.trim() !== '') {
+      for (const lineEv of processFrame(buffer)) yield lineEv;
+    }
+  } finally {
+    reader.releaseLock();
+  }
+
+  // Final chunk with finish_reason and usage
+  if (!hasSentContent) {
+    yield emitChunk({ role: 'assistant', content: '' }, lastFinishReason);
+  } else {
+    yield emitChunk({}, lastFinishReason);
+  }
+  yield emitChunk({}, null, {
+    prompt_tokens: promptTokens,
+    completion_tokens: completionTokens,
+    total_tokens: totalTokens,
+  });
+  yield 'data: [DONE]\n\n';
+}
+
+/** Anthropic body -> Gemini generateContent body. */
+export function anthropicToGemini(body: Json, model: string): Json {
+  const openaiBody = anthropicToOpenAI(body, model);
+  return openAIToGemini(openaiBody, model);
+}
+
+/** Gemini answer -> Anthropic message. */
+export function geminiToAnthropic(answer: Json, model: string): Json {
+  const openaiAnswer = geminiToOpenAI(answer, model);
+  return openAIToAnthropic(openaiAnswer, model);
+}
