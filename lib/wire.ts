@@ -742,3 +742,350 @@ export function geminiToAnthropic(answer: Json, model: string): Json {
   const openaiAnswer = geminiToOpenAI(answer, model);
   return openAIToAnthropic(openaiAnswer, model);
 }
+
+/** OpenAI chat request body -> Anthropic Messages request body. */
+export function openAIToAnthropicRequest(body: Json, model: string): Json {
+  const messages: Json[] = [];
+  const systemParts: string[] = [];
+  const source = Array.isArray(body.messages) ? body.messages : [];
+
+  for (const raw of source) {
+    if (!isRecord(raw)) continue;
+    const role = raw.role;
+    const content = raw.content;
+
+    if (role === 'system') {
+      const text = textOf(content);
+      if (text !== '') systemParts.push(text);
+      continue;
+    }
+
+    if (role === 'assistant') {
+      const contentBlocks: Json[] = [];
+      const text = typeof content === 'string' ? content : textOf(content);
+      if (text !== '') contentBlocks.push({ type: 'text', text });
+
+      const toolCalls = Array.isArray(raw.tool_calls) ? raw.tool_calls : [];
+      for (const call of toolCalls) {
+        if (!isRecord(call) || !isRecord(call.function)) continue;
+        contentBlocks.push({
+          type: 'tool_use',
+          id: typeof call.id === 'string' && call.id !== '' ? call.id : 'toolu_unknown',
+          name: typeof call.function.name === 'string' ? call.function.name : '',
+          input: argumentsOf(call.function.arguments),
+        });
+      }
+
+      messages.push({
+        role: 'assistant',
+        content: contentBlocks.length > 0 ? contentBlocks : [{ type: 'text', text: '' }],
+      });
+      continue;
+    }
+
+    if (role === 'tool') {
+      const toolUseId = typeof raw.tool_call_id === 'string' ? raw.tool_call_id : '';
+      const toolContent = toolResultText(content);
+      messages.push({
+        role: 'user',
+        content: [
+          {
+            type: 'tool_result',
+            tool_use_id: toolUseId,
+            content: toolContent,
+          },
+        ],
+      });
+      continue;
+    }
+
+    // User message
+    const userBlocks: Json[] = [];
+    if (typeof content === 'string') {
+      if (content !== '') userBlocks.push({ type: 'text', text: content });
+    } else if (Array.isArray(content)) {
+      for (const block of content) {
+        if (!isRecord(block)) continue;
+        if (block.type === 'text' && typeof block.text === 'string') {
+          userBlocks.push({ type: 'text', text: block.text });
+        } else if (block.type === 'image_url' && isRecord(block.image_url) && typeof block.image_url.url === 'string') {
+          const url = block.image_url.url;
+          if (url.startsWith('data:')) {
+            const match = url.match(/^data:([^;]+);base64,(.+)$/);
+            if (match) {
+              userBlocks.push({
+                type: 'image',
+                source: { type: 'base64', media_type: match[1], data: match[2] },
+              });
+            } else {
+              userBlocks.push({ type: 'image', source: { type: 'url', url } });
+            }
+          } else {
+            userBlocks.push({ type: 'image', source: { type: 'url', url } });
+          }
+        }
+      }
+    }
+    if (userBlocks.length > 0) {
+      messages.push({ role: 'user', content: userBlocks });
+    }
+  }
+
+  const out: Json = {
+    model,
+    messages,
+    max_tokens: typeof body.max_tokens === 'number' ? body.max_tokens : (typeof body.max_completion_tokens === 'number' ? body.max_completion_tokens : 4096),
+  };
+
+  if (systemParts.length > 0) {
+    out.system = systemParts.join('\n');
+  }
+
+  if (typeof body.temperature === 'number') out.temperature = body.temperature;
+  if (typeof body.top_p === 'number') out.top_p = body.top_p;
+
+  if (Array.isArray(body.stop) && body.stop.length > 0) {
+    out.stop_sequences = body.stop;
+  } else if (typeof body.stop === 'string' && body.stop !== '') {
+    out.stop_sequences = [body.stop];
+  }
+
+  if (Array.isArray(body.tools) && body.tools.length > 0) {
+    const anthropicTools: Json[] = [];
+    for (const tool of body.tools) {
+      if (!isRecord(tool) || !isRecord(tool.function)) continue;
+      const fn = tool.function;
+      anthropicTools.push({
+        name: typeof fn.name === 'string' ? fn.name : '',
+        description: typeof fn.description === 'string' ? fn.description : '',
+        input_schema: isRecord(fn.parameters) ? fn.parameters : { type: 'object', properties: {} },
+      });
+    }
+    if (anthropicTools.length > 0) out.tools = anthropicTools;
+  }
+
+  const choice = body.tool_choice;
+  if (choice === 'auto') {
+    out.tool_choice = { type: 'auto' };
+  } else if (choice === 'required' || choice === 'any') {
+    out.tool_choice = { type: 'any' };
+  } else if (isRecord(choice) && isRecord(choice.function) && typeof choice.function.name === 'string') {
+    out.tool_choice = { type: 'tool', name: choice.function.name };
+  }
+
+  if (body.stream === true) {
+    out.stream = true;
+  }
+
+  return out;
+}
+
+/** Anthropic Messages response JSON -> OpenAI Chat Completion JSON. */
+export function anthropicToOpenAIResponse(answer: Json, model: string): Json {
+  const contentBlocks = Array.isArray(answer.content) ? answer.content : [];
+  let textContent = '';
+  const toolCalls: Json[] = [];
+
+  for (const block of contentBlocks) {
+    if (!isRecord(block)) continue;
+    if (block.type === 'text' && typeof block.text === 'string') {
+      textContent += block.text;
+    } else if (block.type === 'tool_use') {
+      const id = typeof block.id === 'string' ? block.id : `call_${toolCalls.length}`;
+      const name = typeof block.name === 'string' ? block.name : '';
+      const input = isRecord(block.input) ? block.input : {};
+      toolCalls.push({
+        id,
+        type: 'function',
+        function: {
+          name,
+          arguments: JSON.stringify(input),
+        },
+      });
+    }
+  }
+
+  const stopReason = typeof answer.stop_reason === 'string' ? answer.stop_reason : 'end_turn';
+  let finishReason = 'stop';
+  if (stopReason === 'max_tokens') finishReason = 'length';
+  else if (stopReason === 'tool_use') finishReason = 'tool_calls';
+  else if (stopReason === 'refusal') finishReason = 'content_filter';
+
+  const usage = isRecord(answer.usage) ? answer.usage : {};
+  const promptTokens = numberOrZero(usage.input_tokens);
+  const completionTokens = numberOrZero(usage.output_tokens);
+
+  return {
+    id: typeof answer.id === 'string' ? answer.id : 'msg_anthropic',
+    object: 'chat.completion',
+    created: FIXED_OPENAI_CREATED,
+    model,
+    choices: [
+      {
+        index: 0,
+        message: {
+          role: 'assistant',
+          content: textContent !== '' ? textContent : (toolCalls.length > 0 ? null : ''),
+          ...(toolCalls.length > 0 ? { tool_calls: toolCalls } : {}),
+        },
+        finish_reason: finishReason,
+      },
+    ],
+    usage: {
+      prompt_tokens: promptTokens,
+      completion_tokens: completionTokens,
+      total_tokens: promptTokens + completionTokens,
+    },
+  };
+}
+
+/** Async generator yielding OpenAI SSE chunk strings from an Anthropic SSE stream. */
+export async function* anthropicStreamToOpenAI(stream: ReadableStream<Uint8Array>): AsyncGenerator<string> {
+  const reader = stream.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  let promptTokens = 0;
+  let completionTokens = 0;
+  let finishReason = 'stop';
+  let hasSentContent = false;
+  let toolCallIndex = 0;
+
+  // Track tool use IDs by content block index
+  const blockToolIds = new Map<number, string>();
+  const blockToolNames = new Map<number, string>();
+  const blockJsonBuffers = new Map<number, string>();
+
+  const emitChunk = (delta: Json, fin: string | null = null, usage: Json | null = null): string => {
+    const chunk: Json = {
+      id: 'chatcmpl-anthropic',
+      object: 'chat.completion.chunk',
+      created: FIXED_OPENAI_CREATED,
+      model: 'anthropic',
+      choices: [
+        {
+          index: 0,
+          delta,
+          finish_reason: fin,
+        },
+      ],
+    };
+    if (usage) {
+      chunk.usage = usage;
+    }
+    return `data: ${JSON.stringify(chunk)}\n\n`;
+  };
+
+  const processFrame = (frame: string): string[] => {
+    const out: string[] = [];
+    for (const line of frame.split('\n')) {
+      const trimmed = line.trim();
+      if (!trimmed.startsWith('data:')) continue;
+      const payload = trimmed.slice(5).trim();
+      if (payload === '[DONE]') continue;
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(payload);
+      } catch {
+        continue;
+      }
+      if (!isRecord(parsed)) continue;
+
+      const type = parsed.type;
+
+      if (type === 'message_start' && isRecord(parsed.message)) {
+        const usage = isRecord(parsed.message.usage) ? parsed.message.usage : {};
+        promptTokens = numberOrZero(usage.input_tokens);
+      } else if (type === 'content_block_start' && typeof parsed.index === 'number' && isRecord(parsed.content_block)) {
+        const cb = parsed.content_block;
+        if (cb.type === 'tool_use') {
+          const id = typeof cb.id === 'string' ? cb.id : `call_${toolCallIndex}`;
+          const name = typeof cb.name === 'string' ? cb.name : '';
+          blockToolIds.set(parsed.index, id);
+          blockToolNames.set(parsed.index, name);
+          blockJsonBuffers.set(parsed.index, '');
+        }
+      } else if (type === 'content_block_delta' && typeof parsed.index === 'number' && isRecord(parsed.delta)) {
+        const delta = parsed.delta;
+        if (delta.type === 'text_delta' && typeof delta.text === 'string' && delta.text !== '') {
+          if (!hasSentContent) {
+            hasSentContent = true;
+            out.push(emitChunk({ role: 'assistant', content: '' }));
+          }
+          out.push(emitChunk({ content: delta.text }));
+        } else if (delta.type === 'input_json_delta' && typeof delta.partial_json === 'string') {
+          const idx = parsed.index;
+          const current = blockJsonBuffers.get(idx) ?? '';
+          blockJsonBuffers.set(idx, current + delta.partial_json);
+        }
+      } else if (type === 'content_block_stop' && typeof parsed.index === 'number') {
+        const idx = parsed.index;
+        if (blockToolIds.has(idx)) {
+          const id = blockToolIds.get(idx) ?? `call_${toolCallIndex}`;
+          const name = blockToolNames.get(idx) ?? '';
+          const args = blockJsonBuffers.get(idx) ?? '{}';
+          toolCallIndex += 1;
+          finishReason = 'tool_calls';
+          if (!hasSentContent) {
+            hasSentContent = true;
+            out.push(emitChunk({ role: 'assistant', content: null }));
+          }
+          out.push(emitChunk({
+            tool_calls: [
+              {
+                index: 0,
+                id,
+                type: 'function',
+                function: { name, arguments: args },
+              },
+            ],
+          }));
+        }
+      } else if (type === 'message_delta') {
+        if (isRecord(parsed.delta)) {
+          const stop = parsed.delta.stop_reason;
+          if (stop === 'max_tokens') finishReason = 'length';
+          else if (stop === 'tool_use') finishReason = 'tool_calls';
+          else if (stop === 'refusal') finishReason = 'content_filter';
+          else if (stop === 'end_turn') finishReason = 'stop';
+        }
+        if (isRecord(parsed.usage)) {
+          completionTokens = numberOrZero(parsed.usage.output_tokens);
+        }
+      }
+    }
+    return out;
+  };
+
+  try {
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true }).replace(/\r\n/g, '\n');
+      let at = buffer.indexOf('\n\n');
+      while (at !== -1) {
+        const frame = buffer.slice(0, at);
+        buffer = buffer.slice(at + 2);
+        for (const lineEv of processFrame(frame)) yield lineEv;
+        at = buffer.indexOf('\n\n');
+      }
+    }
+    buffer += decoder.decode();
+    if (buffer.trim() !== '') {
+      for (const lineEv of processFrame(buffer)) yield lineEv;
+    }
+  } finally {
+    reader.releaseLock();
+  }
+
+  if (!hasSentContent) {
+    yield emitChunk({ role: 'assistant', content: '' }, finishReason);
+  } else {
+    yield emitChunk({}, finishReason);
+  }
+  yield emitChunk({}, null, {
+    prompt_tokens: promptTokens,
+    completion_tokens: completionTokens,
+    total_tokens: promptTokens + completionTokens,
+  });
+  yield 'data: [DONE]\n\n';
+}

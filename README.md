@@ -1,9 +1,16 @@
-# Make.fun Competition Entry: Multi-Provider Intelligent Gateway
+# Free Model Aggregator Entry
 
-An enterprise-grade, high-performance Deno/TypeScript gateway supporting OpenAI, Anthropic, and Gemini wire protocols with robust multi-provider rating-based routing, budget spreading, and automatic failover.
+An intelligent, resilient multi-provider free model aggregator supporting OpenAI (`/v1/chat/completions`), Anthropic (`/v1/messages`), and Gemini (`/v1beta/models`) upstream wires.
 
 ## Features
-- **Multi-Protocol Support**: Full request/response and SSE streaming translation between OpenAI (`/v1/chat/completions`), Anthropic (`/v1/messages`), and Gemini (`/v1beta/models`).
-- **Rating-Based Routing & Budget Spreading**: Dynamically routes traffic to the highest-rated providers while managing remaining budget allocation.
-- **Failover Loop**: Automatically retries across backup providers on failure or high latency.
-- **CLI Commands**: `--list`, `register`, and `poll`.
+- **Three Upstream Wires**: Full request translation and streaming bidirectional support for OpenAI, Anthropic, and Google Gemini APIs.
+- **Rating Routing**: Ranks free models by evaluation ratings (`rating_milli`) to prioritize higher-quality responses.
+- **Soft Budget Spreading**: Balances traffic across providers, favoring those with fewer than 4 calls to conserve per-provider rate limits.
+- **Robust Failover**: Automatically detects HTTP errors (402, 429, 5xx) or network failures and seamlessly fails over to alternative providers.
+
+## How to Run Grade-Local
+To evaluate the entry locally against the test harness:
+```bash
+cd /home/hatch/workspace/makefun/free-model-aggregator-01-kit
+node cli/makefun.mjs grade-local --kit . --bot /home/hatch/workspace/makefun/free-model-aggregator-01-entry --driver process --instances 3 --worktree
+```
