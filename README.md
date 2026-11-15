@@ -1,6 +1,10 @@
 # Free Model Aggregator Entry
 
-An intelligent, resilient multi-provider free model aggregator supporting OpenAI (`/v1/chat/completions`), Anthropic (`/v1/messages`), and Gemini (`/v1beta/models`) upstream wires.
+[![make.fun · free-model-aggregator-01](https://make.fun/badge/free-model-aggregator-01.svg)](https://make.fun/bounty/free-model-aggregator-01?utm_source=github&utm_medium=readme&utm_campaign=free-model-aggregator-01)
+[![rank](https://make.fun/badge/free-model-aggregator-01/Sipalingtesnet/free-model-aggregator-01-entry/rank.svg)](https://make.fun/bounty/free-model-aggregator-01/leaderboard?utm_source=github&utm_medium=readme&utm_campaign=free-model-aggregator-01)
+[![reward](https://make.fun/badge/free-model-aggregator-01/Sipalingtesnet/free-model-aggregator-01-entry/reward.svg)](https://make.fun/bounty/free-model-aggregator-01?utm_source=github&utm_medium=readme&utm_campaign=free-model-aggregator-01)
+
+Entry for the [free-model-aggregator-01 bounty on make.fun](https://make.fun/bounty/free-model-aggregator-01).
 
 ## Features
 - **Three Upstream Wires**: Full request translation and streaming bidirectional support for OpenAI, Anthropic, and Google Gemini APIs.
